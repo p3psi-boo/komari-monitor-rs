@@ -109,10 +109,6 @@ Options:
           Set Fake Multiplier
           [default: 1]
 
-      --tls
-          Enable TLS (default disabled)
-          [default: false]
-
       --ignore-unsafe-cert
           Ignore Certificate Verification
           [default: false]
@@ -222,7 +218,6 @@ Options:
               terminal-entry = "default";
               fake = 1;
               realtime-info-interval = 1000;
-              tls = true;
               ignore-unsafe-cert = false;
               log-level = "info";
             };

@@ -1,4 +1,4 @@
 fn main() {
-    #[cfg(feature = "winxp-support")]
+    #[cfg(all(feature = "winxp-support", target_os = "windows"))]
     thunk::thunk();
 }

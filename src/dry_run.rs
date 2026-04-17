@@ -1,9 +1,9 @@
 use crate::get_info::cpu::cpu_info_without_usage;
 use crate::get_info::load::realtime_load;
 use crate::get_info::mem::{filter_disks, mem_info_without_usage, realtime_mem, realtime_swap};
+use crate::get_info::network::should_filter_interface;
 use crate::get_info::network::realtime_connections;
 use log::info;
-use std::collections::HashSet;
 use sysinfo::{Disks, Networks};
 
 pub async fn dry_run() {
@@ -53,29 +53,17 @@ pub async fn dry_run() {
 
     info!("");
     info!("Network interfaces will be monitored:");
-    let filter_keywords: HashSet<&str> = [
-        "br", "cni", "docker", "podman", "flannel", "lo", "veth", "virbr", "vmbr", "tap", "tun",
-        "fwln", "fwpr",
-    ]
-    .iter()
-    .cloned()
-    .collect();
     for (name, data) in networks.iter() {
-        let should_filter = filter_keywords
-            .iter()
-            .any(|&keyword| name.contains(keyword));
-
-        if should_filter || data.mac_address().0 == [0, 0, 0, 0, 0, 0] {
+        if should_filter_interface(name, &data.mac_address().0) {
             continue;
-        } else {
-            info!(
-                "{} | {} | UP: {} GB / DOWN: {} GB",
-                name,
-                data.mac_address().to_string(),
-                data.total_transmitted() / 1000 / 1000 / 1000,
-                data.total_received() / 1000 / 1000 / 1000
-            )
         }
+        info!(
+            "{} | {} | UP: {} GB / DOWN: {} GB",
+            name,
+            data.mac_address().to_string(),
+            data.total_transmitted() / 1000 / 1000 / 1000,
+            data.total_received() / 1000 / 1000 / 1000
+        );
     }
     let connections = realtime_connections();
     info!("CONNS: TCP: {} | UDP: {}", connections.tcp, connections.udp);

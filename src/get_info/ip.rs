@@ -26,125 +26,81 @@ struct IpJson {
     ip: String,
 }
 
-// 提取公共的请求函数以减少重复代码
-async fn fetch_ipinfo_v4() -> Option<String> {
+enum IpFamily {
+    V4Only,
+    V6Only,
+}
+
+fn fetch_url_blocking(url: &str, family: Option<IpFamily>) -> Option<String> {
+    #[cfg(not(feature = "ureq-support"))]
+    let _ = family;
+
     #[cfg(feature = "ureq-support")]
     {
-        let resp = ureq::get("https://ipinfo.io")
+        let mut request = ureq::get(url)
             .header("User-Agent", "curl/8.7.1")
             .config()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .ip_family(ureq::config::IpFamily::Ipv4Only)
-            .build()
-            .call();
+            .timeout_global(Some(Duration::from_secs(5)));
 
-        if let Ok(mut response) = resp {
+        if let Some(family) = family {
+            request = request.ip_family(match family {
+                IpFamily::V4Only => ureq::config::IpFamily::Ipv4Only,
+                IpFamily::V6Only => ureq::config::IpFamily::Ipv6Only,
+            });
+        }
+
+        let response = request.build().call();
+        if let Ok(mut response) = response {
             return response.body_mut().read_to_string().ok();
         }
+        return None;
     }
 
-    #[cfg(feature = "nyquest-support")]
+    #[cfg(all(not(feature = "ureq-support"), feature = "nyquest-support"))]
     {
         use nyquest::Request;
         let client = crate::utils::create_nyquest_client(false);
-        let request = Request::get("https://ipinfo.io");
-
-        if let Ok(res) = client.request(request) {
-            return res.text().ok();
+        let request = Request::get(url);
+        if let Ok(response) = client.request(request) {
+            return response.text().ok();
         }
+        return None;
     }
 
+    #[allow(unreachable_code)]
     None
+}
+
+async fn fetch_ipinfo_v4() -> Option<String> {
+    tokio::task::spawn_blocking(|| fetch_url_blocking("https://ipinfo.io", Some(IpFamily::V4Only)))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn fetch_ipinfo_v6() -> Option<String> {
-    #[cfg(feature = "ureq-support")]
-    {
-        let resp = ureq::get("https://6.ipinfo.io")
-            .header("User-Agent", "curl/8.7.1")
-            .config()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .ip_family(ureq::config::IpFamily::Ipv6Only)
-            .build()
-            .call();
-
-        if let Ok(mut response) = resp {
-            return response.body_mut().read_to_string().ok();
-        }
-    }
-
-    #[cfg(feature = "nyquest-support")]
-    {
-        use nyquest::Request;
-        let client = crate::utils::create_nyquest_client(false);
-        let request = Request::get("https://6.ipinfo.io");
-
-        if let Ok(res) = client.request(request) {
-            return res.text().ok();
-        }
-    }
-
-    None
+    tokio::task::spawn_blocking(|| fetch_url_blocking("https://6.ipinfo.io", Some(IpFamily::V6Only)))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn fetch_cloudflare_v4() -> Option<String> {
-    #[cfg(feature = "ureq-support")]
-    {
-        let resp = ureq::get("https://www.cloudflare.com/cdn-cgi/trace")
-            .header("User-Agent", "curl/8.7.1")
-            .config()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .ip_family(ureq::config::IpFamily::Ipv4Only)
-            .build()
-            .call();
-
-        if let Ok(mut response) = resp {
-            return response.body_mut().read_to_string().ok();
-        }
-    }
-
-    #[cfg(feature = "nyquest-support")]
-    {
-        use nyquest::Request;
-        let client = crate::utils::create_nyquest_client(false);
-        let request = Request::get("https://1.1.1.1/cdn-cgi/trace");
-
-        if let Ok(res) = client.request(request) {
-            return res.text().ok();
-        }
-    }
-
-    None
+    tokio::task::spawn_blocking(|| {
+        fetch_url_blocking("https://www.cloudflare.com/cdn-cgi/trace", Some(IpFamily::V4Only))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn fetch_cloudflare_v6() -> Option<String> {
-    #[cfg(feature = "ureq-support")]
-    {
-        let resp = ureq::get("https://www.cloudflare.com/cdn-cgi/trace")
-            .header("User-Agent", "curl/8.7.1")
-            .config()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .ip_family(ureq::config::IpFamily::Ipv6Only)
-            .build()
-            .call();
-
-        if let Ok(mut response) = resp {
-            return response.body_mut().read_to_string().ok();
-        }
-    }
-
-    #[cfg(feature = "nyquest-support")]
-    {
-        use nyquest::Request;
-        let client = crate::utils::create_nyquest_client(false);
-        let request = Request::get("https://[2606:4700:4700::1111]/cdn-cgi/trace");
-
-        if let Ok(res) = client.request(request) {
-            return res.text().ok();
-        }
-    }
-
-    None
+    tokio::task::spawn_blocking(|| {
+        fetch_url_blocking("https://www.cloudflare.com/cdn-cgi/trace", Some(IpFamily::V6Only))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn parse_ipinfo_response(body: &str) -> Option<String> {

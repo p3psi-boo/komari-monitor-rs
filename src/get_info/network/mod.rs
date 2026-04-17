@@ -1,3 +1,7 @@
+// Network traffic calculations intentionally use u64->i64 casts with max(0) clamping
+// to handle signed offset arithmetic. The values are traffic counters that won't overflow.
+#![allow(clippy::cast_possible_wrap)]
+
 use crate::data_struct::Connections;
 use log::trace;
 use sysinfo::Networks;
@@ -148,26 +152,30 @@ pub fn realtime_connections() -> Connections {
     connections
 }
 
+/// Keywords used to filter out virtual/internal network interfaces.
+pub const NETWORK_FILTER_KEYWORDS: &[&str] = &[
+    "br", "cni", "docker", "podman", "flannel", "lo", "veth", "virbr", "vmbr", "tap", "tun",
+    "fwln", "fwpr",
+];
+
+/// Check whether a network interface should be excluded based on its name or MAC address.
+pub fn should_filter_interface(name: &str, mac: &[u8; 6]) -> bool {
+    if mac == &[0, 0, 0, 0, 0, 0] {
+        return true;
+    }
+    NETWORK_FILTER_KEYWORDS.iter().any(|&kw| name.contains(kw))
+}
+
 pub fn filter_network(network: &Networks) -> (u64, u64, u64, u64) {
     let mut total_up = 0;
     let mut total_down = 0;
     let mut up = 0;
     let mut down = 0;
 
-    static FILTER_KEYWORDS: &[&str] = &[
-        "br", "cni", "docker", "podman", "flannel", "lo", "veth", "virbr", "vmbr", "tap", "tun",
-        "fwln", "fwpr",
-    ];
-
     for (name, data) in network {
-        let should_filter = FILTER_KEYWORDS
-            .iter()
-            .any(|&keyword| name.contains(keyword));
-
-        if should_filter || data.mac_address().0 == [0, 0, 0, 0, 0, 0] {
+        if should_filter_interface(name, &data.mac_address().0) {
             continue;
         }
-
         total_up += data.total_transmitted();
         total_down += data.total_received();
         up += data.transmitted();

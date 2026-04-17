@@ -29,10 +29,6 @@ pub struct Args {
     #[arg(short, long, default_value_t = 1.0)]
     pub fake: f64,
 
-    /// Enable TLS (default disabled)
-    #[arg(long, default_value_t = false)]
-    pub tls: bool,
-
     /// Ignore Certificate Verification
     #[arg(long, default_value_t = false)]
     pub ignore_unsafe_cert: bool,
@@ -121,6 +117,21 @@ pub struct NetworkConfig {
 impl Args {
     pub fn par() -> Self {
         let mut args = Self::parse();
+        if args.realtime_info_interval == 0 {
+            error!("`--realtime-info-interval` must be >= 1");
+            std::process::exit(2);
+        }
+
+        if args.network_interval == 0 {
+            error!("`--network-interval` must be >= 1");
+            std::process::exit(2);
+        }
+
+        if args.network_interval_number == 0 {
+            error!("`--network-interval-number` must be >= 1");
+            std::process::exit(2);
+        }
+
         if args.terminal_entry == "default" {
             args.terminal_entry = {
                 if cfg!(windows) {
@@ -184,13 +195,7 @@ impl Args {
             }
         };
 
-        let disable_network_statistics = if self.disable_network_statistics {
-            true
-        } else if !self.disable_network_statistics && path.is_empty() {
-            false
-        } else {
-            false
-        };
+        let disable_network_statistics = self.disable_network_statistics;
 
         NetworkConfig {
             disable_network_statistics,
@@ -218,15 +223,11 @@ impl Display for Args {
         }
 
         if let Some(token) = &self.token {
-            writeln!(f, "  Token: {}", token)?;
+            writeln!(f, "  Token: {}", mask_secret(token))?;
         }
 
         if self.fake != 1.0 {
             writeln!(f, "  Fake Multiplier: {}", self.fake)?;
-        }
-
-        if self.tls {
-            writeln!(f, "  TLS Enabled: true")?;
         }
 
         if self.ignore_unsafe_cert {
@@ -286,6 +287,16 @@ impl Display for Args {
 
 fn terminal_entry() -> String {
     "default".to_string()
+}
+
+fn mask_secret(secret: &str) -> String {
+    if secret.len() <= 8 {
+        return "***".to_string();
+    }
+
+    let start = &secret[..4];
+    let end = &secret[secret.len() - 4..];
+    format!("{start}***{end}")
 }
 
 fn ip_provider() -> IpProvider {

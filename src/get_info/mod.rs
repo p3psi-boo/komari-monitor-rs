@@ -1,5 +1,4 @@
 use log::trace;
-use std::fs;
 use sysinfo::System;
 
 pub mod cpu;
@@ -15,24 +14,9 @@ pub fn realtime_uptime() -> u64 {
     uptime
 }
 
-pub fn realtime_process() -> u64 {
-    let mut process_count = 0;
-
-    let Ok(entries) = fs::read_dir("/proc") else {
-        trace!("REALTIME PROCESS failed: Cannot read /proc directory");
-        return 0;
-    };
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        if let Some(name_str) = file_name.to_str()
-            && name_str.parse::<u32>().is_ok()
-        {
-            process_count += 1;
-        }
-    }
-
-    let process_count = process_count as u64;
+pub fn realtime_process(sysinfo_sys: &System) -> u64 {
+    // Use sysinfo process list for cross-platform support instead of reading /proc
+    let process_count = u64::try_from(sysinfo_sys.processes().len()).unwrap_or(0);
     trace!("REALTIME PROCESS successfully retrieved: {process_count}");
     process_count
 }

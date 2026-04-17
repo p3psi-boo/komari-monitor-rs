@@ -2,12 +2,46 @@ use crate::command_parser::{NetworkConfig, NetworkStatisticsMode, TrafficPeriod}
 use crate::get_info::network::{filter_network, update_traffic_offset};
 use log::{error, info, warn};
 use std::fs;
+use std::io::Write as _;
 use std::time::Duration;
 use sysinfo::Networks;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, Weekday};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+const OFFSET_RECALCULATE_SENTINEL: i64 = i64::MIN;
+const OFFSET_REBOOT_WITHIN_CYCLE_SENTINEL: i64 = i64::MIN + 1;
+const OFFSET_INITIAL_CYCLE_SENTINEL: i64 = i64::MIN + 2;
+
+#[derive(Clone, Copy, Debug)]
+enum OffsetState {
+    Valid { tx: i64, rx: i64 },
+    Recalculate,
+    RebootWithinCycle,
+    InitialCycle,
+}
+
+fn classify_offset_state(offset_tx: i64, offset_rx: i64) -> OffsetState {
+    if offset_tx == OFFSET_RECALCULATE_SENTINEL || offset_rx == OFFSET_RECALCULATE_SENTINEL {
+        return OffsetState::Recalculate;
+    }
+
+    if offset_tx == OFFSET_REBOOT_WITHIN_CYCLE_SENTINEL
+        || offset_rx == OFFSET_REBOOT_WITHIN_CYCLE_SENTINEL
+    {
+        return OffsetState::RebootWithinCycle;
+    }
+
+    if offset_tx == OFFSET_INITIAL_CYCLE_SENTINEL || offset_rx == OFFSET_INITIAL_CYCLE_SENTINEL {
+        return OffsetState::InitialCycle;
+    }
+
+    OffsetState::Valid {
+        tx: offset_tx,
+        rx: offset_rx,
+    }
+}
 
 /// Represents the state of network statistics saved to disk
 #[derive(PartialEq, Clone, Debug)]
@@ -26,11 +60,11 @@ struct NetworkInfo {
 
 impl NetworkInfo {
     pub fn encode(&self) -> String {
-        let mut output = String::new();
-        // Helper macro
+        let mut output = Vec::new();
+        // Helper macro using write! to avoid temporary String allocation
         macro_rules! append_line {
             ($key:expr, $value:expr) => {
-                output.push_str(&format!("{}={}\n", $key, $value));
+                writeln!(output, "{}={}", $key, $value).unwrap();
             };
         }
 
@@ -61,7 +95,7 @@ impl NetworkInfo {
         append_line!("offset_tx", self.offset_tx);
         append_line!("offset_rx", self.offset_rx);
 
-        output
+        String::from_utf8(output).unwrap()
     }
 
     pub fn decode(input: &str) -> Result<Self, String> {
@@ -80,9 +114,9 @@ impl NetworkInfo {
         let mut cycle_total_tx = None;
         let mut cycle_total_rx = None;
         let mut next_reset_timestamp = None;
-        // Default to sentinel value if not found
-        let mut offset_tx = i64::MIN;
-        let mut offset_rx = i64::MIN;
+        // Default to a recalculation sentinel when offset fields are absent.
+        let mut offset_tx = OFFSET_RECALCULATE_SENTINEL;
+        let mut offset_rx = OFFSET_RECALCULATE_SENTINEL;
 
         for line in input.lines() {
             let line = line.trim();
@@ -92,20 +126,20 @@ impl NetworkInfo {
 
             let (key, value) = line
                 .split_once('=')
-                .ok_or_else(|| format!("Format error: expected key=value, got '{}'", line))?;
+                .ok_or_else(|| format!("Format error: expected key=value, got '{line}'"))?;
             let key = key.trim();
             let value = value.trim();
 
-            let parse_err = |type_name: &str| format!("Invalid {} for key '{}'", type_name, key);
+            let parse_err = |type_name: &str| format!("Invalid {type_name} for key '{key}'");
 
             match key {
                 // Config
                 "disable_network_statistics" => {
                     disable_network_statistics =
-                        Some(value.parse::<bool>().map_err(|_| parse_err("bool"))?)
+                        Some(value.parse::<bool>().map_err(|_| parse_err("bool"))?);
                 }
                 "network_interval" => {
-                    network_interval = Some(value.parse::<u32>().map_err(|_| parse_err("u32"))?)
+                    network_interval = Some(value.parse::<u32>().map_err(|_| parse_err("u32"))?);
                 }
                 "network_save_path" => network_save_path = Some(value.to_string()),
                 "traffic_period" => {
@@ -125,24 +159,24 @@ impl NetworkInfo {
                     };
                 }
                 "network_duration" => {
-                    network_duration = Some(value.parse::<u32>().map_err(|_| parse_err("u32"))?)
+                    network_duration = Some(value.parse::<u32>().map_err(|_| parse_err("u32"))?);
                 }
                 "network_interval_number" => {
                     network_interval_number =
-                        Some(value.parse::<u32>().map_err(|_| parse_err("u32"))?)
+                        Some(value.parse::<u32>().map_err(|_| parse_err("u32"))?);
                 }
 
                 // Info
                 "boot_id" => boot_id = Some(value.to_string()),
                 "cycle_total_tx" => {
-                    cycle_total_tx = Some(value.parse::<u64>().map_err(|_| parse_err("u64"))?)
+                    cycle_total_tx = Some(value.parse::<u64>().map_err(|_| parse_err("u64"))?);
                 }
                 "cycle_total_rx" => {
-                    cycle_total_rx = Some(value.parse::<u64>().map_err(|_| parse_err("u64"))?)
+                    cycle_total_rx = Some(value.parse::<u64>().map_err(|_| parse_err("u64"))?);
                 }
                 "next_reset_timestamp" => {
                     next_reset_timestamp =
-                        Some(value.parse::<i64>().map_err(|_| parse_err("i64"))?)
+                        Some(value.parse::<i64>().map_err(|_| parse_err("i64"))?);
                 }
                 "offset_tx" => offset_tx = value.parse::<i64>().map_err(|_| parse_err("i64"))?,
                 "offset_rx" => offset_rx = value.parse::<i64>().map_err(|_| parse_err("i64"))?,
@@ -190,7 +224,7 @@ pub async fn network_saver(network_config: &NetworkConfig) {
             match initialize_network_state_and_offset(network_config, &mut networks).await {
                 Ok(state) => state,
                 Err(e) => {
-                    error!("Failed to initialize network statistics: {}. This feature will be disabled.", e);
+                    error!("Failed to initialize network statistics: {e}. This feature will be disabled.");
                     return;
                 }
             };
@@ -212,7 +246,7 @@ pub async fn network_saver(network_config: &NetworkConfig) {
         // Main loop for the current cycle
         loop {
             tokio::time::sleep(Duration::from_secs(
-                network_config.network_interval as u64,
+                u64::from(network_config.network_interval),
             ))
             .await;
 
@@ -225,21 +259,27 @@ pub async fn network_saver(network_config: &NetworkConfig) {
             networks.refresh(true);
             let (_, _, current_total_tx, current_total_rx) = filter_network(&networks);
 
-            // Update the live total traffic value using the constant offset for this cycle
-            network_info.cycle_total_tx = (current_total_tx as i64 + offset_tx).max(0) as u64;
-            network_info.cycle_total_rx = (current_total_rx as i64 + offset_rx).max(0) as u64;
+            // Update the live total traffic value using the constant offset for this cycle.
+            // These casts are intentional: traffic counters are u64, but offsets are i64
+            // for arithmetic flexibility. In practice, traffic values will not overflow i64.
+            #[allow(clippy::cast_possible_wrap)]
+            let signed_tx = current_total_tx as i64;
+            #[allow(clippy::cast_possible_wrap)]
+            let signed_rx = current_total_rx as i64;
+            network_info.cycle_total_tx = u64::try_from((signed_tx + offset_tx).max(0)).unwrap_or(0);
+            network_info.cycle_total_rx = u64::try_from((signed_rx + offset_rx).max(0)).unwrap_or(0);
 
             memory_update_count += 1;
             if memory_update_count >= network_config.network_interval_number {
                 // Save the updated state to the file
                 if let Err(e) = save_network_info(&mut file, &network_info).await {
-                    error!("Failed to save network statistics file: {}", e);
+                    error!("Failed to save network statistics file: {e}");
                     // Continue, maybe it's a temporary issue
                 } else {
                     info!("Network statistics saved.");
                 }
                 memory_update_count = 0;
-            }      
+            }
         }
     }
 }
@@ -254,6 +294,7 @@ async fn initialize_network_state_and_offset(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&network_config.network_save_path)
         .await
     {
@@ -276,8 +317,8 @@ async fn initialize_network_state_and_offset(
             cycle_total_tx: 0,
             cycle_total_rx: 0,
             next_reset_timestamp,
-            offset_tx: i64::MIN + 2,    // initial value for tx
-            offset_rx: i64::MIN + 2,
+            offset_tx: OFFSET_INITIAL_CYCLE_SENTINEL,
+            offset_rx: OFFSET_INITIAL_CYCLE_SENTINEL,
         }
     } else if let Ok(info) = NetworkInfo::decode(&raw_data) {
         info!("Loaded network statistics from file.");
@@ -298,8 +339,8 @@ async fn initialize_network_state_and_offset(
             cycle_total_tx: old_tx,
             cycle_total_rx: old_rx,
             next_reset_timestamp,
-            offset_tx: i64::MIN + 2,
-            offset_rx: i64::MIN + 2,
+            offset_tx: OFFSET_INITIAL_CYCLE_SENTINEL,
+            offset_rx: OFFSET_INITIAL_CYCLE_SENTINEL,
         }
     };
 
@@ -316,8 +357,8 @@ async fn initialize_network_state_and_offset(
         network_info.cycle_total_tx = 0;
         network_info.cycle_total_rx = 0;
         network_info.next_reset_timestamp = calculate_next_reset_timestamp(network_config, now)?;
-        network_info.offset_tx = i64::MIN;
-        network_info.offset_rx = i64::MIN;
+        network_info.offset_tx = OFFSET_RECALCULATE_SENTINEL;
+        network_info.offset_rx = OFFSET_RECALCULATE_SENTINEL;
     }
 
     // 3. Handle reboot: if boot ID changed, invalidate the offset from the file.
@@ -325,8 +366,8 @@ async fn initialize_network_state_and_offset(
         cfg!(target_os = "linux") && !new_boot_id.is_empty() && network_info.boot_id != new_boot_id;
     if is_reboot {
         info!("System reboot detected. Invalidating saved offset.");
-        network_info.offset_tx = i64::MIN + 1;
-        network_info.offset_rx = i64::MIN + 1;
+        network_info.offset_tx = OFFSET_REBOOT_WITHIN_CYCLE_SENTINEL;
+        network_info.offset_rx = OFFSET_REBOOT_WITHIN_CYCLE_SENTINEL;
     }
     network_info.boot_id = new_boot_id;
 
@@ -334,29 +375,57 @@ async fn initialize_network_state_and_offset(
     networks.refresh(true);
     let (_, _, current_total_tx, current_total_rx) = filter_network(networks);
 
-    if network_info.offset_tx == i64::MIN {
-        // Offset is invalid (due to reboot, new cycle, or new file) and must be recalculated.
-        let new_offset_tx = (network_info.cycle_total_tx as i64) - (current_total_tx as i64);
-        let new_offset_rx = (network_info.cycle_total_rx as i64) - (current_total_rx as i64);
-        info!("Recalculated network offset: tx={}, rx={}", new_offset_tx, new_offset_rx);
-        network_info.offset_tx = new_offset_tx;
-        network_info.offset_rx = new_offset_rx;
-    } else if network_info.offset_tx == (i64::MIN + 1) {
-        network_info.offset_tx = network_info.cycle_total_tx as i64;
-        network_info.offset_rx = network_info.cycle_total_rx as i64;
-        info!("reboot in one statistics cycle, network offset: tx={}, rx={}", network_info.offset_tx, network_info.offset_rx);
-    } else if network_info.offset_tx == (i64::MIN + 2) {
-        if network_info.cycle_total_tx == 0 && network_info.cycle_total_rx == 0 { 
-            network_info.offset_tx = 0;
-            network_info.offset_rx = 0;
-        } else {
-            network_info.offset_tx = (network_info.cycle_total_tx as i64) - (current_total_tx as i64);
-            network_info.offset_rx = (network_info.cycle_total_rx as i64) - (current_total_rx as i64);
+    match classify_offset_state(network_info.offset_tx, network_info.offset_rx) {
+        OffsetState::Recalculate => {
+            // Recalculate from current interface counters to preserve continuity.
+            // These casts are intentional: traffic counters are u64 but offsets are i64.
+            #[allow(clippy::cast_possible_wrap)]
+            let new_offset_tx = (network_info.cycle_total_tx as i64) - (current_total_tx as i64);
+            #[allow(clippy::cast_possible_wrap)]
+            let new_offset_rx = (network_info.cycle_total_rx as i64) - (current_total_rx as i64);
+            info!("Recalculated network offset: tx={new_offset_tx}, rx={new_offset_rx}");
+            network_info.offset_tx = new_offset_tx;
+            network_info.offset_rx = new_offset_rx;
         }
-        info!("initial statistics cycle, network offset: tx={}, rx={}", network_info.offset_tx, network_info.offset_rx);
-    } else {
-        // Offset from file is valid (program restart without reboot). Use it directly.
-        info!("Using existing network offset from file: tx={}, rx={}", network_info.offset_tx, network_info.offset_rx);
+        OffsetState::RebootWithinCycle => {
+            // These casts are intentional: traffic counters are u64 but offsets are i64.
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                network_info.offset_tx = network_info.cycle_total_tx as i64;
+                network_info.offset_rx = network_info.cycle_total_rx as i64;
+            }
+            info!(
+                "reboot in one statistics cycle, network offset: tx={}, rx={}",
+                network_info.offset_tx, network_info.offset_rx
+            );
+        }
+        OffsetState::InitialCycle => {
+            if network_info.cycle_total_tx == 0 && network_info.cycle_total_rx == 0 {
+                network_info.offset_tx = 0;
+                network_info.offset_rx = 0;
+            } else {
+                // These casts are intentional: traffic counters are u64 but offsets are i64.
+                #[allow(clippy::cast_possible_wrap)]
+                let offset_tx = (network_info.cycle_total_tx as i64) - (current_total_tx as i64);
+                #[allow(clippy::cast_possible_wrap)]
+                let offset_rx = (network_info.cycle_total_rx as i64) - (current_total_rx as i64);
+                network_info.offset_tx = offset_tx;
+                network_info.offset_rx = offset_rx;
+            }
+            info!(
+                "initial statistics cycle, network offset: tx={}, rx={}",
+                network_info.offset_tx, network_info.offset_rx
+            );
+        }
+        OffsetState::Valid { tx, rx } => {
+            // Persisted offset remains authoritative across agent restarts in same boot/cycle.
+            network_info.offset_tx = tx;
+            network_info.offset_rx = rx;
+            info!(
+                "Using existing network offset from file: tx={}, rx={}",
+                network_info.offset_tx, network_info.offset_rx
+            );
+        }
     }
 
     update_traffic_offset(network_info.offset_tx, network_info.offset_rx);
@@ -397,25 +466,25 @@ fn calculate_next_reset_timestamp(
                 "sun" | "7" => Weekday::Sunday,
                 _ => {
                     return Err(format!(
-                        "Invalid weekday '{}', must be 1-7 or mon-sun",
-                        reset_day_str
+                        "Invalid weekday '{reset_day_str}', must be 1-7 or mon-sun"
                     ))
                 }
             };
 
             let mut days_to_add =
-                target_weekday.number_from_monday() as i64 - now.weekday().number_from_monday() as i64;
+                i64::from(target_weekday.number_from_monday())
+                    - i64::from(now.weekday().number_from_monday());
             if days_to_add <= 0 {
                 days_to_add += 7;
             }
-            next_reset_date = next_reset_date + time::Duration::days(days_to_add);
+            next_reset_date += time::Duration::days(days_to_add);
         }
         TrafficPeriod::Month => {
             let reset_day = reset_day_str
                 .parse::<u8>()
-                .map_err(|_| format!("Invalid day of month '{}', must be a number 1-31", reset_day_str))?;
+                .map_err(|_| format!("Invalid day of month '{reset_day_str}', must be a number 1-31"))?;
             if !(1..=31).contains(&reset_day) {
-                return Err(format!("Invalid day of month '{}', must be 1-31", reset_day));
+                return Err(format!("Invalid day of month '{reset_day}', must be 1-31"));
             }
 
             let mut target_date = now.date();
@@ -439,23 +508,22 @@ fn calculate_next_reset_timestamp(
             let parts: Vec<&str> = reset_day_str.split('/').collect();
             if parts.len() != 2 {
                 return Err(format!(
-                    "Invalid date format for year reset '{}', expected 'MM/DD'",
-                    reset_day_str
+                    "Invalid date format for year reset '{reset_day_str}', expected 'MM/DD'"
                 ));
             }
-            let month = parts[0].parse::<u8>().map_err(|_| format!("Invalid month in '{}'", reset_day_str))?;
-            let day = parts[1].parse::<u8>().map_err(|_| format!("Invalid day in '{}'", reset_day_str))?;
-            let month_enum = Month::try_from(month).map_err(|_| format!("Invalid month value '{}', must be 1-12", month))?;
+            let month = parts[0].parse::<u8>().map_err(|_| format!("Invalid month in '{reset_day_str}'"))?;
+            let day = parts[1].parse::<u8>().map_err(|_| format!("Invalid day in '{reset_day_str}'"))?;
+            let month_enum = Month::try_from(month).map_err(|_| format!("Invalid month value '{month}', must be 1-12"))?;
 
             let mut next_year = now.year();
             let reset_date_this_year = Date::from_calendar_date(next_year, month_enum, day)
-                .map_err(|e| format!("Invalid date '{}/{}': {}", month, day, e))?;
+                .map_err(|e| format!("Invalid date '{month}/{day}': {e}"))?;
 
             if now.date() >= reset_date_this_year {
                 next_year += 1;
             }
             next_reset_date = Date::from_calendar_date(next_year, month_enum, day).map_err(|e| {
-                format!("Invalid date '{}/{}' for year {}: {}", month, day, next_year, e)
+                format!("Invalid date '{month}/{day}' for year {next_year}: {e}")
             })?;
         }
     }
@@ -468,11 +536,14 @@ fn calculate_next_reset_timestamp(
 fn days_in_month(year: i32, month: Month) -> u8 {
     let next_month = month.next();
     let next_year = if next_month == Month::January { year + 1 } else { year };
-    let last_day = Date::from_calendar_date(next_year, next_month, 1).unwrap().previous_day().unwrap();
+    let last_day = Date::from_calendar_date(next_year, next_month, 1)
+        .unwrap()
+        .previous_day()
+        .unwrap();
     last_day.day()
 }
 
-/// Saves the NetworkInfo struct to the given file as a JSON string.
+/// Saves the `NetworkInfo` struct to the given file as a key-value string.
 async fn save_network_info(file: &mut File, info: &NetworkInfo) -> Result<(), std::io::Error> {
     let content = info.encode();
     file.rewind().await?;
@@ -484,12 +555,13 @@ async fn save_network_info(file: &mut File, info: &NetworkInfo) -> Result<(), st
 /// Gets the boot ID from the kernel. Returns an empty string on non-Linux or on error.
 fn get_boot_id() -> String {
     if cfg!(target_os = "linux") {
-        fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|e| {
-                warn!("Failed to read boot_id: {}", e);
+        match fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                warn!("Failed to read boot_id: {e}");
                 String::new()
-            })
+            }
+        }
     } else {
         String::new()
     }

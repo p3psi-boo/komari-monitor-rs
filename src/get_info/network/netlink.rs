@@ -1,3 +1,7 @@
+// SAFETY: This module uses raw pointers for netlink socket operations.
+// Clippy alignment warnings are suppressed where we intentionally use unaligned reads.
+#![allow(clippy::cast_ptr_alignment)]
+
 use libc::{c_void, close, recvfrom, sendto, sockaddr, sockaddr_nl, socket};
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -5,12 +9,11 @@ use std::os::fd::RawFd;
 use std::ptr;
 
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
-const ALL_TCP_STATES: u32 = 0xffffffff;
+const ALL_TCP_STATES: u32 = 0xffff_ffff;
 const TCP_ESTABLISHED: u32 = 1;
 const NLMSG_HDRLEN: usize = size_of::<libc::nlmsghdr>();
 
 /// ---- C structures aligned with kernel ----
-
 // from linux/inet_diag.h
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -69,7 +72,7 @@ pub fn connections_count_with_protocol(family: u8, protocol: u8) -> io::Result<u
     }
 
     // Serialize into a Netlink message (header + payload)
-    let msg = serialize_netlink_message(&hdr, &req)?;
+    let msg = serialize_netlink_message(&hdr, &req);
 
     // Send and only count the number of returned messages
     netlink_inet_diag_only_count(&msg)
@@ -91,10 +94,10 @@ fn netlink_inet_diag_only_count(request: &[u8]) -> io::Result<u64> {
     let ret = unsafe {
         sendto(
             fd,
-            request.as_ptr() as *const c_void,
+            request.as_ptr().cast::<c_void>(),
             request.len(),
             0,
-            &addr as *const sockaddr_nl as *const sockaddr,
+            (&raw const addr).cast::<sockaddr>(),
             size_of::<sockaddr_nl>() as u32,
         )
     };
@@ -113,7 +116,7 @@ fn netlink_inet_diag_only_count(request: &[u8]) -> io::Result<u64> {
         let nr = unsafe {
             recvfrom(
                 fd,
-                buf.as_mut_ptr() as *mut c_void,
+                buf.as_mut_ptr().cast::<c_void>(),
                 buf.len(),
                 0,
                 ptr::null_mut(),
@@ -140,44 +143,65 @@ fn netlink_inet_diag_only_count(request: &[u8]) -> io::Result<u64> {
     Ok(total_count)
 }
 
-/// Only count netlink messages in this batch buffer; return done=true upon DONE/ERROR
+/// Only count netlink messages in this batch buffer; return `done=true` upon `DONE`/`ERROR`
+/// `NLMSG_DONE` is not counted as a valid message; `NLMSG_ERROR` is treated as an error.
 fn count_netlink_messages(mut b: &[u8]) -> io::Result<(u64, bool)> {
     let mut msgs: u64 = 0;
     let mut done = false;
 
     while b.len() >= NLMSG_HDRLEN {
-        let (dlen, at_end) = netlink_message_header(b)?;
-        msgs += 1;
+        let (dlen, at_end, is_error, errno) = netlink_message_header(b)?;
+        if is_error {
+            // NLMSG_ERROR contains a negative errno in its payload; return it as an OS error.
+            #[allow(clippy::cast_possible_wrap)]
+            let os_errno = if errno == 0 { libc::EIO } else { errno.unsigned_abs() as i32 };
+            return Err(io::Error::from_raw_os_error(os_errno));
+        }
         if at_end {
+            // NLMSG_DONE marks the end of the dump; do not count it
             done = true;
             break;
         }
+        msgs += 1;
         b = &b[dlen..];
     }
 
     Ok((msgs, done))
 }
 
-/// Parse nlmsghdr of the current slice, return (aligned length of this message, whether DONE/ERROR)
-fn netlink_message_header(b: &[u8]) -> io::Result<(usize, bool)> {
+/// Parse nlmsghdr of the current slice, return (aligned length, `is_done`, `is_error`, errno)
+/// Uses `read_unaligned` to avoid UB from potentially unaligned netlink message headers.
+fn netlink_message_header(b: &[u8]) -> io::Result<(usize, bool, bool, i32)> {
     if b.len() < NLMSG_HDRLEN {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
 
-    // Safely read the header (in native byte order)
-    let h = unsafe { &*(b.as_ptr() as *const libc::nlmsghdr) };
+    // Use read_unaligned to safely read the header without assuming alignment
+    let h: libc::nlmsghdr = unsafe { std::ptr::read_unaligned(b.as_ptr().cast::<libc::nlmsghdr>()) };
     let len = h.nlmsg_len as usize;
+    #[allow(clippy::cast_possible_wrap)]
     let l = nlm_align_of(len as i32) as usize;
 
     if len < NLMSG_HDRLEN || l > b.len() {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
 
-    if h.nlmsg_type == libc::NLMSG_DONE as u16 || h.nlmsg_type == libc::NLMSG_ERROR as u16 {
-        return Ok((l, true));
+    if h.nlmsg_type == libc::NLMSG_DONE as u16 {
+        return Ok((l, true, false, 0));
     }
 
-    Ok((l, false))
+    if h.nlmsg_type == libc::NLMSG_ERROR as u16 {
+        // NLMSG_ERROR payload contains a signed errno (negative on error) after the nlmsghdr
+        let errno = if len >= NLMSG_HDRLEN + size_of::<i32>() {
+            let errno_ptr = unsafe { b.as_ptr().add(NLMSG_HDRLEN).cast::<i32>() };
+            unsafe { std::ptr::read_unaligned(errno_ptr) }
+        } else {
+            0
+        };
+        return Ok((l, true, true, errno));
+    }
+
+    Ok((l, false, false, 0))
 }
 
 /// Align to 4 bytes
@@ -187,7 +211,7 @@ fn nlm_align_of(msglen: i32) -> i32 {
 }
 
 /// Serialize (header, payload) into a Netlink message (fill back header.len)
-fn serialize_netlink_message(hdr: &libc::nlmsghdr, req: &InetDiagReqV2) -> io::Result<Vec<u8>> {
+fn serialize_netlink_message(hdr: &libc::nlmsghdr, req: &InetDiagReqV2) -> Vec<u8> {
     let total = NLMSG_HDRLEN + size_of::<InetDiagReqV2>();
     let mut msg = vec![0u8; total];
 
@@ -198,19 +222,19 @@ fn serialize_netlink_message(hdr: &libc::nlmsghdr, req: &InetDiagReqV2) -> io::R
     unsafe {
         // header
         ptr::copy_nonoverlapping(
-            &h as *const libc::nlmsghdr as *const u8,
+            (&raw const h).cast::<u8>(),
             msg.as_mut_ptr(),
             NLMSG_HDRLEN,
         );
         // payload
         ptr::copy_nonoverlapping(
-            req as *const InetDiagReqV2 as *const u8,
+            std::ptr::from_ref(req).cast::<u8>(),
             msg.as_mut_ptr().add(NLMSG_HDRLEN),
             size_of::<InetDiagReqV2>(),
         );
     }
 
-    Ok(msg)
+    msg
 }
 
 /// Simple FD guard

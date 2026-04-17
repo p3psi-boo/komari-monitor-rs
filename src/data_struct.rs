@@ -11,6 +11,64 @@ use log::{debug, error, info};
 use miniserde::{Deserialize, Serialize};
 use sysinfo::{Disks, Networks};
 
+fn scale_u64(value: u64, factor: f64) -> u64 {
+    (value as f64 * factor) as u64
+}
+
+#[cfg(feature = "ureq-support")]
+fn push_basic_info_ureq(url: &str, payload: &str, ignore_unsafe_cert: bool) -> Result<(), String> {
+    use crate::utils::create_ureq_agent;
+
+    let agent = create_ureq_agent(ignore_unsafe_cert);
+    let response = agent
+        .post(url)
+        .header("User-Agent", "curl/11.45.14-rs")
+        .send(payload)
+        .map_err(|e| e.to_string())?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTP status code: {}", response.status()))
+    }
+}
+
+#[cfg(all(not(feature = "ureq-support"), feature = "nyquest-support"))]
+fn push_basic_info_nyquest(
+    url: &str,
+    payload: &str,
+    ignore_unsafe_cert: bool,
+) -> Result<(), String> {
+    use nyquest::{Body, Request};
+
+    let client = crate::utils::create_nyquest_client(ignore_unsafe_cert);
+    let body = Body::text(payload.to_string(), "application/json");
+    let response = client
+        .request(Request::post(url.to_string()).with_body(body))
+        .map_err(|e| e.to_string())?;
+
+    if response.status().is_successful() {
+        Ok(())
+    } else {
+        Err(format!("HTTP status code: {}", response.status()))
+    }
+}
+
+fn push_basic_info_blocking(url: &str, payload: &str, ignore_unsafe_cert: bool) -> Result<(), String> {
+    #[cfg(feature = "ureq-support")]
+    {
+        return push_basic_info_ureq(url, payload, ignore_unsafe_cert);
+    }
+
+    #[cfg(all(not(feature = "ureq-support"), feature = "nyquest-support"))]
+    {
+        return push_basic_info_nyquest(url, payload, ignore_unsafe_cert);
+    }
+
+    #[allow(unreachable_code)]
+    Err("No HTTP backend enabled".to_string())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BasicInfo {
     pub arch: String,
@@ -37,10 +95,10 @@ impl BasicInfo {
         let mem_disk = mem_info_without_usage(sysinfo_sys);
         let (ip, os) = tokio::join!(ip(ip_provider), os());
 
-        let fake_cpu_cores = (f64::from(cpu.cores) * fake) as u64;
-        let fake_disk_total = (mem_disk.disk as f64 * fake) as u64;
-        let fake_swap_total = (mem_disk.swap as f64 * fake) as u64;
-        let fake_mem_total = (mem_disk.mem as f64 * fake) as u64;
+        let fake_cpu_cores = scale_u64(u64::from(cpu.cores), fake);
+        let fake_disk_total = scale_u64(mem_disk.disk, fake);
+        let fake_swap_total = scale_u64(mem_disk.swap, fake);
+        let fake_mem_total = scale_u64(mem_disk.mem, fake);
 
         let basic_info = Self {
             arch: arch(),
@@ -63,58 +121,18 @@ impl BasicInfo {
         basic_info
     }
 
-    pub fn push(&self, basic_info_url: String, ignore_unsafe_cert: bool) {
+    pub async fn push(&self, basic_info_url: String, ignore_unsafe_cert: bool) {
         let json_string = miniserde::json::to_string(self);
-        #[cfg(feature = "ureq-support")]
-        {
-            use crate::utils::create_ureq_agent;
-            let agent = create_ureq_agent(ignore_unsafe_cert);
-            let resp = agent
-                .post(basic_info_url)
-                .header("User-Agent", "curl/11.45.14-rs")
-                .send(&json_string);
 
-            let resp = match resp {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Failed to push Basic Info: {e}");
-                    return;
-                }
-            };
+        let result = tokio::task::spawn_blocking(move || {
+            push_basic_info_blocking(&basic_info_url, &json_string, ignore_unsafe_cert)
+        })
+        .await;
 
-            if resp.status().is_success() {
-                info!("Successfully pushed Basic Info");
-            } else {
-                error!(
-                    "Failed to push Basic Info, HTTP status code: {}",
-                    resp.status()
-                );
-            }
-        }
-        #[cfg(feature = "nyquest-support")]
-        {
-            use nyquest::Body;
-            use nyquest::Request;
-            let client = crate::utils::create_nyquest_client(ignore_unsafe_cert);
-            let body = Body::text(json_string, "application/json");
-            let resp = client.request(Request::post(basic_info_url).with_body(body));
-
-            let resp = match resp {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Failed to push Basic Info: {e}");
-                    return;
-                }
-            };
-
-            if resp.status().is_successful() {
-                info!("Successfully pushed Basic Info");
-            } else {
-                error!(
-                    "Failed to push Basic Info, HTTP status code: {}",
-                    resp.status()
-                );
-            }
+        match result {
+            Ok(Ok(())) => info!("Successfully pushed Basic Info"),
+            Ok(Err(e)) => error!("Failed to push Basic Info: {e}"),
+            Err(e) => error!("Failed to join Basic Info push task: {e}"),
         }
     }
 }
@@ -191,16 +209,16 @@ impl RealTimeInfo {
         let cpu = realtime_cpu(sysinfo_sys);
 
         let ram = realtime_mem(sysinfo_sys);
-        let fake_ram_used = (ram.used as f64 * fake) as u64;
-        let fake_ram_total = (ram.total as f64 * fake) as u64;
+        let fake_ram_used = scale_u64(ram.used, fake);
+        let fake_ram_total = scale_u64(ram.total, fake);
 
         let swap = realtime_swap(sysinfo_sys);
-        let fake_swap_used = (swap.used as f64 * fake) as u64;
-        let fake_swap_total = (swap.total as f64 * fake) as u64;
+        let fake_swap_used = scale_u64(swap.used, fake);
+        let fake_swap_total = scale_u64(swap.total, fake);
 
         let disk_info = realtime_disk(disk);
-        let fake_disk_used = (disk_info.used as f64 * fake) as u64;
-        let fake_disk_total = (disk_info.total as f64 * fake) as u64;
+        let fake_disk_used = scale_u64(disk_info.used, fake);
+        let fake_disk_total = scale_u64(disk_info.total, fake);
 
         let load = realtime_load();
         let fake_load1 = load.load1 * fake;
@@ -208,17 +226,17 @@ impl RealTimeInfo {
         let fake_load15 = load.load15 * fake;
 
         let network_info = realtime_network(network, interval_ms);
-        let fake_network_up = (network_info.up as f64 * fake) as u64;
-        let fake_network_down = (network_info.down as f64 * fake) as u64;
-        let fake_network_total_up = (network_info.total_up as f64 * fake) as u64;
-        let fake_network_total_down = (network_info.total_down as f64 * fake) as u64;
+        let fake_network_up = scale_u64(network_info.up, fake);
+        let fake_network_down = scale_u64(network_info.down, fake);
+        let fake_network_total_up = scale_u64(network_info.total_up, fake);
+        let fake_network_total_down = scale_u64(network_info.total_down, fake);
 
         let connections = realtime_connections();
-        let fake_connections_tcp = (connections.tcp as f64 * fake) as u64;
-        let fake_connections_udp = (connections.udp as f64 * fake) as u64;
+        let fake_connections_tcp = scale_u64(connections.tcp, fake);
+        let fake_connections_udp = scale_u64(connections.udp, fake);
 
-        let process = realtime_process();
-        let fake_process = (process as f64 * fake) as u64;
+        let process = realtime_process(sysinfo_sys);
+        let fake_process = scale_u64(process, fake);
 
         let realtime_info = Self {
             cpu,

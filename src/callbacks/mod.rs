@@ -9,7 +9,7 @@ use log::{error, info};
 use miniserde::{Deserialize, Serialize, json};
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -30,17 +30,21 @@ pub async fn handle_callbacks(
     connection_urls: &ConnectionUrls,
     reader: &mut Reader,
     locked_writer: &LockedWriter,
-) -> () {
+) {
+    let limiter = Arc::new(Semaphore::new(32));
+
     while let Some(msg) = reader.next().await {
-        let Ok(msg) = msg else {
-            continue;
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("Callback stream read error, reconnect required: {e}");
+                break;
+            }
         };
 
         let Ok(utf8) = msg.into_text() else {
             continue;
         };
-
-        info!("Received message from main server: {}", utf8.as_str());
 
         let json: Msg = if let Ok(value) = json::from_str(utf8.as_str()) {
             value
@@ -48,21 +52,35 @@ pub async fn handle_callbacks(
             continue;
         };
 
+        info!("Received callback message type: {}", json.message);
+
         let utf8_cloned = utf8.clone();
 
         match json.message.as_str() {
             "exec" => {
                 if args.terminal {
+                    let permit = match limiter.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            error!("Callback limiter closed: {e}");
+                            break;
+                        }
+                    };
+
                     tokio::spawn({
                         let utf8_cloned_for_exec = utf8_cloned.clone();
                         let exec_callback_url = connection_urls.exec_callback.clone();
+                        let terminal_entry = args.terminal_entry.clone();
                         let ignore_unsafe_cert = args.ignore_unsafe_cert;
 
                         async move {
+                            // Keep permit for task lifetime to cap concurrent callback execution.
+                            let _permit = permit;
                             if let Err(e) = exec_command(
                                 &utf8_cloned_for_exec,
                                 exec_callback_url,
-                                &ignore_unsafe_cert,
+                                &terminal_entry,
+                                ignore_unsafe_cert,
                             )
                             .await
                             {
@@ -76,8 +94,18 @@ pub async fn handle_callbacks(
             }
 
             "ping" => {
+                let permit = match limiter.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        error!("Callback limiter closed: {e}");
+                        break;
+                    }
+                };
+
                 let locked_write_for_ping = locked_writer.clone();
                 tokio::spawn(async move {
+                    // Keep permit for task lifetime to cap concurrent callback execution.
+                    let _permit = permit;
                     match ping_target(&utf8_cloned).await {
                         Ok(json_res) => {
                             let mut write = locked_write_for_ping.lock().await;
@@ -100,11 +128,22 @@ pub async fn handle_callbacks(
 
             "terminal" => {
                 if args.terminal {
-                    let ws_terminal_url = connection_urls.clone().ws_terminal.clone();
+                    let permit = match limiter.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            error!("Callback limiter closed: {e}");
+                            break;
+                        }
+                    };
+
+                    let ws_terminal_url = connection_urls.ws_terminal.clone();
                     let args = args.clone();
                     let utf8_cloned = utf8_cloned.clone();
 
                     tokio::spawn(async move {
+                        // Keep permit for task lifetime to cap concurrent callback execution.
+                        let _permit = permit;
+
                         let ws_url = match get_pty_ws_link(&utf8_cloned, &ws_terminal_url) {
                             Ok(ws_url) => ws_url,
                             Err(e) => {
@@ -113,14 +152,13 @@ pub async fn handle_callbacks(
                             }
                         };
 
-                        let ws_stream =
-                            match connect_ws(&ws_url, args.tls, args.ignore_unsafe_cert).await {
-                                Ok(ws_stream) => ws_stream,
-                                Err(e) => {
-                                    error!("Failed to connect to PTY WebSocket: {e}");
-                                    return;
-                                }
-                            };
+                        let ws_stream = match connect_ws(&ws_url, args.ignore_unsafe_cert).await {
+                            Ok(ws_stream) => ws_stream,
+                            Err(e) => {
+                                error!("Failed to connect to PTY WebSocket: {e}");
+                                return;
+                            }
+                        };
 
                         if let Err(e) = handle_pty_session(ws_stream, &args.terminal_entry).await {
                             error!("PTY WebSocket handling error: {e}");
@@ -133,4 +171,8 @@ pub async fn handle_callbacks(
             _ => {}
         }
     }
+
+    // Closing the writer forces the main loop to reconnect after callback stream failure.
+    let mut write = locked_writer.lock().await;
+    let _ = write.close().await;
 }

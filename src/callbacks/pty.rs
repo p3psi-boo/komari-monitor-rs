@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::mpsc, task};
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Message};
+use url::Url;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalEvent {
@@ -18,10 +19,10 @@ pub fn get_pty_ws_link(utf8_str: &str, ws_terminal_url: &str) -> Result<String, 
     let ping_event: TerminalEvent = miniserde::json::from_str(utf8_str)
         .map_err(|_| "Failed to parse TerminalEvent".to_string())?;
 
-    Ok(format!(
-        "{ws_terminal_url}&id={request_id}",
-        request_id = ping_event.request_id
-    ))
+    let mut url = Url::parse(ws_terminal_url)
+        .map_err(|e| format!("Failed to parse terminal WebSocket URL: {e}"))?;
+    url.query_pairs_mut().append_pair("id", &ping_event.request_id);
+    Ok(url.to_string())
 }
 
 pub async fn handle_pty_session<S>(ws_stream: WebSocketStream<S>, cmd: &str) -> Result<(), String>
@@ -85,7 +86,7 @@ where
         }
     });
 
-    let pty_to_ws_task = tokio::spawn(async move {
+    let mut pty_to_ws_task = tokio::spawn(async move {
         let mut ws_sender = ws_sender;
         while let Some(data) = pty_to_ws_rx.recv().await {
             if ws_sender
@@ -99,7 +100,7 @@ where
         }
     });
 
-    let ws_to_pty_task = tokio::spawn(async move {
+    let mut ws_to_pty_task = tokio::spawn(async move {
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(msg) => match handle_ws_message(msg, &pty_writer) {
@@ -128,8 +129,16 @@ where
     });
 
     tokio::select! {
-        _ = pty_to_ws_task => info!("PTY -> WebSocket task finished."),
-        _ = ws_to_pty_task => info!("WebSocket -> PTY task finished."),
+        _ = &mut pty_to_ws_task => {
+            info!("PTY -> WebSocket task finished.");
+            ws_to_pty_task.abort();
+            let _ = ws_to_pty_task.await;
+        }
+        _ = &mut ws_to_pty_task => {
+            info!("WebSocket -> PTY task finished.");
+            pty_to_ws_task.abort();
+            let _ = pty_to_ws_task.await;
+        }
     }
 
     info!("Closing session, terminating child process...");

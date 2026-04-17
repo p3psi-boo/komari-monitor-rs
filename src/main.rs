@@ -2,10 +2,31 @@
 #![allow(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::similar_names,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    // Additional allows for existing codebase style debt:
+    clippy::uninlined_format_args,
+    clippy::semicolon_if_nothing_returned,
+    clippy::match_same_arms,
+    clippy::let_and_return,
+    clippy::unreadable_literal,
+    clippy::ip_constant,
+    clippy::struct_excessive_bools,
+    clippy::manual_string_new,
+    clippy::float_cmp,
+    clippy::explicit_iter_loop,
+    clippy::collapsible_if,
+    clippy::match_bool,
+    clippy::redundant_closure_for_method_calls,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::ignored_unit_patterns,
+    clippy::single_match_else,
+    clippy::if_not_else,
+    clippy::manual_let_else,
+    clippy::cloned_instead_of_copied,
+    clippy::struct_field_names,
+    clippy::to_string_in_format_args
 )]
 
 use crate::callbacks::handle_callbacks;
@@ -21,7 +42,10 @@ use miniserde::json;
 use std::process::exit;
 use std::sync::Arc;
 use std::time::Duration;
-use sysinfo::{CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind};
+use sysinfo::{
+    CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessesToUpdate,
+    RefreshKind,
+};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -35,6 +59,9 @@ mod dry_run;
 mod get_info;
 mod rustls_config;
 mod utils;
+
+#[cfg(not(any(feature = "ureq-support", feature = "nyquest-support")))]
+compile_error!("Enable at least one HTTP transport feature: `ureq-support` or `nyquest-support`.");
 
 #[tokio::main]
 async fn main() {
@@ -50,12 +77,9 @@ async fn main() {
 
     let network_config = args.network_config();
 
-    let (http_server, token) = match (args.http_server.clone(), args.token.clone()) {
-        (Some(http_server), Some(token)) => (http_server, token),
-        (_, _) => {
-            error!("The `--http-server` and `--token` parameters must be specified.");
-            exit(1);
-        }
+    let (Some(http_server), Some(token)) = (args.http_server.clone(), args.token.clone()) else {
+        error!("The `--http-server` and `--token` parameters must be specified.");
+        exit(1);
     };
 
     for line in args.to_string().lines() {
@@ -80,7 +104,7 @@ async fn main() {
     {
         if !args.disable_toast_notify {
             use win_toast_notify::{Action, ActivationType, WinToastNotify};
-            WinToastNotify::new()
+            if let Err(e) = WinToastNotify::new()
                 .set_title("Komari-monitor-rs Is Running!")
                 .set_messages(vec![
                     "Komari-monitor-rs is an application used to monitor your system, granting it near-complete access to your computer. If you did not actively install this program, please check your system immediately. If you have intentionally used this software on your system, please ignore this message or add `--disable-toast-notify` to your startup parameters."
@@ -100,26 +124,24 @@ async fn main() {
                     },
                 ])
                 .show()
-                .expect("Failed to show toast notification");
+            {
+                error!("Failed to show toast notification: {e}");
+            }
         }
     }
 
-    if !network_config.disable_network_statistics {
-        let _listener = tokio::spawn(async move {
-            network_saver(&network_config).await;
-        });
-    } else {
+    if network_config.disable_network_statistics {
         info!(
             "Network statistics feature disabled. This will fallback to statistics only showing network interface traffic since the current startup"
         );
+    } else {
+        std::mem::drop(tokio::spawn(async move {
+            network_saver(&network_config).await;
+        }));
     }
 
     loop {
-        let Ok(ws_stream) = connect_ws(
-            &connection_urls.ws_real_time,
-            args.tls,
-            args.ignore_unsafe_cert,
-        )
+        let Ok(ws_stream) = connect_ws(&connection_urls.ws_real_time, args.ignore_unsafe_cert)
         .await
         else {
             error!("Failed to connect to WebSocket server, retrying in 5 seconds");
@@ -134,20 +156,18 @@ async fn main() {
         > = Arc::new(Mutex::new(write));
 
         // Handle callbacks
-        {
-            let args_cloned = args.clone();
-            let connection_urls_cloned = connection_urls.clone();
-            let locked_write_cloned = locked_write.clone();
-            let _listener = tokio::spawn(async move {
-                handle_callbacks(
-                    &args_cloned,
-                    &connection_urls_cloned,
-                    &mut read,
-                    &locked_write_cloned,
-                )
-                .await;
-            });
-        }
+        let args_cloned = args.clone();
+        let connection_urls_cloned = connection_urls.clone();
+        let locked_write_cloned = locked_write.clone();
+        let callback_listener = tokio::spawn(async move {
+            handle_callbacks(
+                &args_cloned,
+                &connection_urls_cloned,
+                &mut read,
+                &locked_write_cloned,
+            )
+            .await;
+        });
 
         let mut sysinfo_sys = sysinfo::System::new();
         let mut networks = Networks::new_with_refreshed_list();
@@ -161,7 +181,9 @@ async fn main() {
 
         let basic_info = BasicInfo::build(&sysinfo_sys, args.fake, &args.ip_provider).await;
 
-        basic_info.push(connection_urls.basic_info.clone(), args.ignore_unsafe_cert);
+        basic_info
+            .push(connection_urls.basic_info.clone(), args.ignore_unsafe_cert)
+            .await;
 
         loop {
             let start_time = tokio::time::Instant::now();
@@ -170,6 +192,7 @@ async fn main() {
                     .with_cpu(CpuRefreshKind::everything().without_frequency())
                     .with_memory(MemoryRefreshKind::everything()),
             );
+            sysinfo_sys.refresh_processes(ProcessesToUpdate::All, true);
             networks.refresh(true);
             disks.refresh_specifics(true, DiskRefreshKind::nothing().with_storage());
             let real_time = RealTimeInfo::build(
@@ -198,5 +221,8 @@ async fn main() {
             }))
             .await;
         }
+
+        callback_listener.abort();
+        let _ = callback_listener.await;
     }
 }
