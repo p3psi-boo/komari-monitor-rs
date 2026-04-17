@@ -7,7 +7,7 @@ use std::{env, fs};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    version,
+    version = env!("KOMARI_BUILD_VERSION"),
     long_about = "komari-monitor-rs is a third-party high-performance monitoring agent for the komari monitoring service.",
     after_long_help = "Must set --http-server / --token\n--ip-provider accepts cloudflare / ipinfo\n--log-level accepts error, warn, info, debug, trace\n\nThis Agent is open-sourced on Github, powered by powerful Rust. Love from Komari"
 )]
@@ -147,50 +147,46 @@ impl Args {
     }
     pub fn network_config(&self) -> NetworkConfig {
         let path = {
-            if self.network_save_path.is_none() {
-                if cfg!(windows) {
-                    PathBuf::from(r"C:\komari-network.conf")
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    let is_root = env::var("EUID")
+            if let Some(network_save_path) = &self.network_save_path {
+                let path = PathBuf::from(network_save_path).to_string_lossy().to_string();
+                info!("Using specified Network Config save path: {}", path);
+                path
+            } else if cfg!(windows) {
+                PathBuf::from(r"C:\komari-network.conf")
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                let is_root = env::var("EUID")
+                    .unwrap_or("999".to_string())
+                    .parse::<i32>()
+                    .unwrap_or(999)
+                    == 0
+                    || env::var("UID")
                         .unwrap_or("999".to_string())
                         .parse::<i32>()
                         .unwrap_or(999)
-                        == 0
-                        || env::var("UID")
-                            .unwrap_or("999".to_string())
-                            .parse::<i32>()
-                            .unwrap_or(999)
-                            == 0;
-                    let path = if is_root {
-                        PathBuf::from("/etc/komari-network.conf")
-                            .to_string_lossy()
-                            .to_string()
-                    } else {
-                        let home = env::var("HOME").unwrap_or_else(|_| {
-                            error!(
-                                        "Failed to automatically determine Network Config save path, this feature will be disabled."
-                                    );
-                            String::from("")
-                        });
+                        == 0;
+                let path = if is_root {
+                    PathBuf::from("/etc/komari-network.conf")
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    let home = env::var("HOME").unwrap_or_else(|_| {
+                        error!(
+                                    "Failed to automatically determine Network Config save path, this feature will be disabled."
+                                );
+                        String::from("")
+                    });
 
-                        PathBuf::from(home)
-                            .join(".config/komari-network.conf")
-                            .to_string_lossy()
-                            .to_string()
-                    };
-                    info!(
-                        "Automatically determined Network Config save path: {}",
-                        path
-                    );
+                    PathBuf::from(home)
+                        .join(".config/komari-network.conf")
+                        .to_string_lossy()
+                        .to_string()
+                };
+                info!(
+                    "Automatically determined Network Config save path: {}",
                     path
-                }
-            } else {
-                let path = PathBuf::from(self.network_save_path.as_ref().unwrap())
-                    .to_string_lossy()
-                    .to_string();
-                info!("Using specified Network Config save path: {}", path);
+                );
                 path
             }
         };

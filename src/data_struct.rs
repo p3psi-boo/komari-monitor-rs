@@ -111,7 +111,7 @@ impl BasicInfo {
             ipv4: ip.ipv4.map(|ip| ip.to_string()),
             ipv6: ip.ipv6.map(|ip| ip.to_string()),
             os: os.os,
-            version: format!("komari-monitor-rs {}", env!("CARGO_PKG_VERSION")),
+            version: format!("komari-monitor-rs {}", env!("KOMARI_BUILD_VERSION")),
             kernel_version: os.version,
             virtualization: os.virtualization,
         };
