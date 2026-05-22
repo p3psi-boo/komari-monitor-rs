@@ -9,11 +9,7 @@ pub struct OsInfo {
 }
 
 pub async fn os() -> OsInfo {
-    let os = format!(
-        "{} {}",
-        System::name().unwrap_or_default(),
-        System::os_version().unwrap_or_default()
-    );
+    let os = compose_os_display_name(platform_os_name(), System::os_version());
     let kernel_version = System::kernel_version().unwrap_or("Unknown".to_string());
 
     let virt = {
@@ -76,4 +72,58 @@ pub async fn os() -> OsInfo {
     trace!("OS INFO successfully retrieved: {os_info:?}");
 
     os_info
+}
+
+#[cfg(target_os = "macos")]
+fn platform_os_name() -> Option<String> {
+    Some("macOS".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_os_name() -> Option<String> {
+    System::name()
+}
+
+fn compose_os_display_name(name: Option<String>, version: Option<String>) -> String {
+    let name = name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let version = version
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty());
+
+    match version {
+        Some(version) => format!("{name} {version}"),
+        None => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_os_display_name;
+
+    #[test]
+    fn compose_os_display_name_includes_version_when_present() {
+        assert_eq!(
+            compose_os_display_name(Some("macOS".to_string()), Some("15.7".to_string())),
+            "macOS 15.7"
+        );
+    }
+
+    #[test]
+    fn compose_os_display_name_does_not_leave_trailing_space_without_version() {
+        assert_eq!(
+            compose_os_display_name(Some("Linux".to_string()), None),
+            "Linux"
+        );
+    }
+
+    #[test]
+    fn compose_os_display_name_falls_back_when_name_is_empty() {
+        assert_eq!(
+            compose_os_display_name(Some(" ".to_string()), Some("1.0".to_string())),
+            "Unknown 1.0"
+        );
+    }
 }
