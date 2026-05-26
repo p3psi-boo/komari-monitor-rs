@@ -35,7 +35,7 @@ pub fn mem_info_without_usage(sysinfo_sys: &System) -> MemDiskTotalInfoWithOutUs
 
 pub fn realtime_mem(sysinfo_sys: &System) -> Ram {
     let ram = Ram {
-        used: sysinfo_sys.total_memory() - sysinfo_sys.available_memory(),
+        used: sysinfo_sys.used_memory(),
         total: sysinfo_sys.total_memory(),
     };
     trace!("REALTIME MEM successfully retrieved: {ram:?}");
